@@ -1,0 +1,552 @@
+services:
+  autocomplete-nim:
+    command: |
+      nim-serve --max-model-len 4096 --gpu-memory-utilization 0.15 --enable-prefix-caching
+    depends_on:
+      cache-flush-autocomplete:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      NIM_LOG_LEVEL: WARNING
+      NIM_MODEL_PATH: ${NIM_AUTOCOMPLETE_MODEL_URI:-ngc://nvidia/blueprint/cuda-autocomplete:0.3.0}
+      NIM_SERVED_MODEL_NAME: nvdev/sw-gpu/qwen-2.5-7b-atlas
+    healthcheck:
+      interval: 30s
+      retries: 10
+      start_period: 60s
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8000/v1/models
+      timeout: 10s
+    image: nvcr.io/nim/nvidia/model-free-nim:2.0.4
+    ipc: host
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8011"
+        target: 8000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+        target: /opt/nim/.cache
+        type: bind
+  autocomplete-nim-cache:
+    command: |
+      --model-uri ${NIM_AUTOCOMPLETE_MODEL_URI:-ngc://nvidia/blueprint/cuda-autocomplete:0.3.0} --model-cache-path /opt/nim/.cache --use-cache
+    depends_on:
+      gpt-oss-nim-cache:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    entrypoint:
+      - download-to-cache
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+    image: nvcr.io/nim/nvidia/model-free-nim:2.0.4
+    restart: "no"
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+        target: /opt/nim/.cache
+        type: bind
+  cache-flush-autocomplete:
+    command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
+    container_name: cache_flush_autocomplete
+    depends_on:
+      test-gpt-oss:
+        condition: service_completed_successfully
+        required: true
+    image: alpine:3.23.0
+    privileged: true
+    restart: "no"
+  cache-flush-bge:
+    command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
+    container_name: cache_flush_bge
+    depends_on:
+      test-autocomplete:
+        condition: service_completed_successfully
+        required: true
+    image: alpine:3.23.0
+    privileged: true
+    restart: "no"
+  cache-flush-gpt-oss:
+    command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
+    container_name: cache_flush_gpt_oss
+    depends_on:
+      model-prep:
+        condition: service_completed_successfully
+        required: true
+      rerank-nim-cache:
+        condition: service_completed_successfully
+        required: true
+    image: alpine:3.23.0
+    privileged: true
+    restart: "no"
+  cache-flush-rerank:
+    command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
+    container_name: cache_flush_rerank
+    depends_on:
+      test-bge:
+        condition: service_completed_successfully
+        required: true
+    image: alpine:3.23.0
+    privileged: true
+    restart: "no"
+  etcd:
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    container_name: milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    healthcheck:
+      interval: 30s
+      retries: 3
+      test:
+        - CMD
+        - etcdctl
+        - endpoint
+        - health
+      timeout: 20s
+    image: quay.io/coreos/etcd:v3.5.5
+    volumes:
+      - bind:
+          create_host_path: true
+        source: ./etcd/data
+        target: /etcd
+        type: bind
+  gpt-oss-nim:
+    depends_on:
+      cache-flush-gpt-oss:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      NIM_KVCACHE_PERCENT: 0.65
+      NIM_MAX_MODEL_LEN: 32768
+    healthcheck:
+      interval: 30s
+      retries: 10
+      start_period: 20m
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8000/v1/health/ready
+      timeout: 10s
+    image: nvcr.io/nim/openai/gpt-oss-120b:1.6.1
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8010"
+        target: 8000
+    shm_size: 16g
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+        target: /opt/nim/.cache
+        type: bind
+  gpt-oss-nim-cache:
+    command: |
+      --profiles --model-cache-path /opt/nim/.cache --use-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    entrypoint:
+      - download-to-cache
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+    image: nvcr.io/nim/openai/gpt-oss-120b:1.6.1
+    restart: "no"
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+        target: /opt/nim/.cache
+        type: bind
+  litellm:
+    command: --config /app/config.yaml --port 8000
+    depends_on:
+      test-rerank:
+        condition: service_completed_successfully
+        required: true
+    healthcheck:
+      interval: 30s
+      retries: 10
+      start_period: 10s
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')
+      timeout: 10s
+    image: ghcr.io/berriai/litellm:main-v1.81.12-stable.1
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8000"
+        target: 8000
+    volumes:
+      - source: ./litellm-config.yaml
+        target: /app/config.yaml
+        type: bind
+  minio:
+    command: minio server /minio_data --console-address ":9001"
+    container_name: milvus-minio
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_ACCESS_KEY:-minio_admin}
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY_ID:-minio_admin}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:9000/minio/health/live
+      timeout: 20s
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "9001"
+        target: 9001
+      - mode: ingress
+        protocol: tcp
+        published: "9000"
+        target: 9000
+    volumes:
+      - bind:
+          create_host_path: true
+        source: ./minio/data
+        target: /minio_data
+        type: bind
+  model-prep:
+    entrypoint:
+      - bash
+      - /model-prep.sh
+    image: nvcr.io/nim/nvidia/model-free-nim:2.0.4
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}
+        target: /offline_inference_data
+        type: bind
+      - read_only: true
+        source: ./model-prep.sh
+        target: /model-prep.sh
+        type: bind
+    working_dir: /offline_inference_data
+  nsight-copilot-offline:
+    depends_on:
+      litellm:
+        condition: service_healthy
+        required: true
+    environment:
+      DD_TRACE_ENABLED: false
+      NSC_ENVIRONMENT: offline
+    image: nvcr.io/nvidia/blueprint/nsight-copilot:1.0.1
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8080"
+        target: 8080
+  rag-server-offline:
+    command: bash rag_server/entrypoint_offline.sh
+    depends_on:
+      standalone:
+        condition: service_healthy
+        required: true
+    environment:
+      DTAI_CODE_SUMMARIZATION_MODEL: ${CODE_SUMMARIZATION_MODEL:-nvdev/sw-gpu/gpt-oss-120b}
+      DTAI_DEFAULT_LLM: ${DEFAULT_LLM:-nvdev/sw-gpu/gpt-oss-120b}
+      DTAI_ENABLE_TRACING: ${ENABLE_TRACING:-false}
+      DTAI_GITHUB_TOKEN: ${GITHUB_TOKEN}
+      DTAI_INFERENCE_URI: ${INFERENCE_URI:-http://litellm:8000/v1}
+      DTAI_INTERNAL_ENDPOINT_API_KEY: ${INTERNAL_ENDPOINT_API_KEY}
+      DTAI_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DTAI_MILVUS_URI: ${MILVUS_URI:-http://standalone:19530}
+      DTAI_NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      DTAI_OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-otel-collector:4317}
+      DTAI_OTEL_EXPORTER_OTLP_INSECURE: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+      DTAI_PRIVATE_ENDPOINT_API_KEY: ${PRIVATE_ENDPOINT_API_KEY:-local-dummy-key}
+      DTAI_RERANKER_BASE_URL: ${RERANKER_BASE_URL:-http://rerank-nim:8000/v1}
+      DTAI_RERANKER_MODEL_NAME: ${RERANKER_MODEL_NAME:-nvidia/llama-nemotron-rerank-1b-v2}
+      DTAI_RERANKER_TOP_N: ${RERANKER_TOP_N:-2}
+      DTAI_TOOL_CALL_PLANNER__LLM__MODEL_NAME: ${TOOL_CALL_PLANNER_LLM_MODEL_NAME:-nvdev/sw-gpu/gpt-oss-120b}
+      DTAI_embedding__default__base_uri: ${EMBEDDING_URI:-http://litellm:8000/v1}
+      DTAI_embedding__default__model_type: ${EMBED_MODEL_TYPE:-local}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8000/v1/health/ready
+      timeout: 10s
+    image: nvcr.io/nvidia/blueprint/nsight-copilot-rag:1.0.1
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8030"
+        target: 8000
+  rerank-nim:
+    depends_on:
+      cache-flush-rerank:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      NIM_HTTP_MAX_WORKERS: 2
+    healthcheck:
+      interval: 30s
+      retries: 10
+      start_period: 60s
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8000/v1/health/ready
+      timeout: 10s
+    image: nvcr.io/nim/nvidia/llama-nemotron-rerank-1b-v2:1.10.0
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8020"
+        target: 8000
+    shm_size: 16g
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+        target: /opt/nim/.cache
+        type: bind
+  rerank-nim-cache:
+    command: |
+      --profiles --model-cache-path /opt/nim/.cache --use-cache
+    depends_on:
+      autocomplete-nim-cache:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    entrypoint:
+      - download-to-cache
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+    image: nvcr.io/nim/nvidia/llama-nemotron-rerank-1b-v2:1.10.0
+    restart: "no"
+    user: ${USER_ID}
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+        target: /opt/nim/.cache
+        type: bind
+  standalone:
+    command:
+      - milvus
+      - run
+      - standalone
+    container_name: milvus-standalone
+    depends_on:
+      etcd:
+        condition: service_healthy
+        required: true
+      minio:
+        condition: service_healthy
+        required: true
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      LOG_LEVEL: ${MILVUS_LOG_LEVEL:-warn}
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY_ID:-minio_admin}
+      MINIO_ADDRESS: minio:9000
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY:-minio_admin}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 90s
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:9091/healthz
+      timeout: 20s
+    image: milvusdb/milvus:v2.4.10
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "19530"
+        target: 19530
+      - mode: ingress
+        protocol: tcp
+        published: "9091"
+        target: 9091
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - bind:
+          create_host_path: true
+        source: ./milvus/data
+        target: /var/lib/milvus
+        type: bind
+  test-autocomplete:
+    command: |
+      sh -c '
+        echo "Testing autocomplete completions endpoint...";
+        response="$$(curl -f -s --max-time 60 -X POST http://autocomplete-nim:8000/v1/completions \
+          -H "Content-Type: application/json" \
+          -d "{\"model\": \"nvdev/sw-gpu/qwen-2.5-7b-atlas\", \"prompt\": \"def add(a, b):\\n    return\", \"max_tokens\": 8, \"temperature\": 0, \"stop\": [\"\\n\\n\", \"\\ndef\", \"\\nclass\"]}")" || exit 1
+
+        case "$$response" in
+          *\"choices\"*\"text\"*)
+            echo "autocomplete completions test passed"
+            ;;
+          *)
+            echo "$$response"
+            exit 1
+            ;;
+        esac
+      '
+    depends_on:
+      autocomplete-nim:
+        condition: service_healthy
+        required: true
+    image: curlimages/curl:8.17.0
+  test-bge:
+    command: |
+      sh -c '
+        echo "Testing BGE service...";
+        curl -f -s -X POST http://vllm-bge:8000/v1/embeddings \
+          -H "Content-Type: application/json" \
+          -d "{\"model\": \"/models/bge-m3\", \"input\": [\"The quick brown fox jumps over the lazy dog.\", \"Artificial intelligence is transforming the world.\"]}" \
+          && echo "BGE test passed" || exit 1
+      '
+    depends_on:
+      vllm-bge:
+        condition: service_healthy
+        required: true
+    image: curlimages/curl:8.17.0
+  test-gpt-oss:
+    command: |
+      sh -c '
+        echo "Testing GPT-OSS service...";
+        curl -f -s -X POST http://gpt-oss-nim:8000/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d "{\"model\": \"openai/gpt-oss-120b\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}" \
+          && echo "GPT-OSS test passed" || exit 1
+      '
+    depends_on:
+      gpt-oss-nim:
+        condition: service_healthy
+        required: true
+    image: curlimages/curl:8.17.0
+  test-rerank:
+    command: |
+      sh -c '
+        echo "Testing Rerank service...";
+        curl -f -s -X POST http://rerank-nim:8000/v1/ranking \
+          -H "Content-Type: application/json" \
+          -d "{\"model\": \"nvidia/llama-nemotron-rerank-1b-v2\", \"query\": {\"text\": \"What is machine learning?\"}, \"passages\": [{\"text\": \"Machine learning is a subset of AI.\"}, {\"text\": \"The weather is nice today.\"}]}" \
+          && echo "Rerank test passed" || exit 1
+      '
+    depends_on:
+      rerank-nim:
+        condition: service_healthy
+        required: true
+    image: curlimages/curl:8.17.0
+  vllm-bge:
+    command: |
+      vllm serve /models/bge-m3 --gpu-memory-utilization 0.01
+    depends_on:
+      cache-flush-bge:
+        condition: service_completed_successfully
+        required: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              count: all
+    healthcheck:
+      interval: 30s
+      retries: 10
+      start_period: 60s
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8000/v1/models
+      timeout: 10s
+    image: nvcr.io/nvidia/vllm:25.11-py3
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/models/bge-m3
+        target: /models/bge-m3
+        type: bind
+x-cache-flush-common:
+  command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
+  image: alpine:3.23.0
+  privileged: true
+  restart: "no"
+x-nim-cache-common:
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - capabilities:
+              - gpu
+  entrypoint:
+    - download-to-cache
+  environment:
+    NGC_API_KEY: ${NGC_API_KEY}
+  restart: "no"
+  user: ${USER_ID}
+  volumes:
+    - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
+      target: /opt/nim/.cache
+      type: bind
