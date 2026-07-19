@@ -1,3 +1,23 @@
+# Nsight Copilot 26.2.1 (19 July 2026)
+
+Multi-GPU support
+
+## New Features
+
+- Support for multi-GPU and heterogeneous GPU configurations, including H100, H200, GH200, and DGX Spark.
+
+## Improvements
+
+- MCP returns more accurate cuTile results.
+- Upgraded python dependencies.
+
+## Bug Fixes
+
+- Don't crash nor allow empty str input for RAG.
+- Remove unused python dependencies.
+- Adjust autocomplete model default config and use it if config is not provided by the client.
+- Remove meaningless warnings during RAG boot.
+
 # Nsight Copilot 26.1.1 (04 Jun 2026)
 
 Initial public release of the NVIDIA AI Blueprint: Nsight Copilot — a self-hosted,

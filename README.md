@@ -28,7 +28,7 @@ This blueprint deploys **Nsight Copilot** on DGX Spark — a self-hosted backend
 ### NVIDIA Models
 
 - [gpt-oss-120b NIM](https://build.nvidia.com/nvidia/gpt-oss-120b) — LLM for chat and RAG-augmented code generation
-- nvidia/CUDA-autocomplete — Specialized model for real-time CUDA code completion
+- [nvidia/CUDA-autocomplete](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/blueprint/models/cuda-autocomplete) — Specialized model for real-time CUDA code completion
 - [llama-nemotron-rerank-1b-v2 NIM](https://build.nvidia.com/nvidia/llama-nemotron-rerank-1b-v2) — Reranking model for retrieval relevance
 
 ### Models
@@ -45,13 +45,19 @@ This blueprint deploys **Nsight Copilot** on DGX Spark — a self-hosted backend
 ## Minimum System Requirements
 
 ### Hardware Requirements
-- NVIDIA DGX Spark
+- An NVIDIA GPU setup that can host the models — the setup script auto-detects the GPUs and picks the layout, and aborts early with guidance if the host is too small. One of:
+  - **DGX Spark** (single GB10, 128 GB) — the reference setup; or
+  - a **multi-GPU** host with one GPU **≥ 80 GB** for the LLM plus a second GPU for the smaller models (autocomplete, embedding, reranker) — e.g. 2× H100, dual GH200, H200; or
+  - a **single GPU** large enough for the whole stack (~100 GB+, e.g. GH200).
+  - The LLM GPU must be **Hopper or newer** (compute capability ≥ 9.0) — gpt-oss is MXFP4, so Ampere (e.g. A100) isn't supported regardless of memory.
+  - A single 80 GB GPU on its own is **not** enough — it fits the LLM but not the LLM and the other models together. Splitting the LLM across several smaller GPUs (tensor parallelism) is not configured automatically.
 - At least 200 GB of free disk space for Docker images, model weights, caches, and vector database data
 
 ### OS Requirements
 - Ubuntu 22.04+
 
 ### Software Requirements
+- NVIDIA GPU driver
 - Docker with Compose v2
 - NVIDIA Container Toolkit
 
