@@ -8,6 +8,18 @@ First startup on DGX Spark can take tens of minutes — a one-time cost of pulli
 
 On every start, including restarts, the services load the models one at a time, because the single GPU and 128 GB of unified memory (shared between CPU and GPU) cannot hold them all at once; memory is freed between each load. GPT-OSS is the slowest to load, around 15 minutes (engine initialization, compilation, CUDA graph capture, and KV-cache setup), and the other models are faster.
 
+## Supported hardware
+
+The blueprint is tuned for DGX Spark by default and the setup script auto-detects the host's GPUs to choose a placement layout — no manual configuration is required:
+
+| Host | Layout |
+| --- | --- |
+| **Single GPU large enough for everything (e.g. DGX Spark, 128 GB unified)** | All models share the one GPU; per-model memory fractions are sized to fit the shared pool. |
+| **Multi-GPU with a GPU ≥ 80 GB for the LLM + a second GPU (e.g. 2× H100, dual GH200)** | GPT-OSS gets a dedicated GPU (the largest) with a larger KV cache; the autocomplete (7B), embedding, and reranker models are packed onto a second GPU. Any further GPUs are left idle. |
+| **GPUs too small (a single 80 GB GPU, or all GPUs below the floor)** | No automatic layout fits, so the setup script stops with guidance — use suitable hardware or configure tensor-parallel serving manually (it is not set up automatically). |
+
+GPT-OSS runs on a single GPU (TP=1) rather than tensor-parallel across GPUs: it fits on one GPU (the ~63 GB MXFP4 weights plus KV cache; compose caps the context with `NIM_MAX_MODEL_LEN` so it runs in ~75 GB on an 80 GB GPU), so the NCCL communication overhead of splitting it outweighs the bandwidth gain. The same reasoning pins the autocomplete model (7B) to a single GPU. On every start the services still load one model at a time so peak memory stays bounded.
+
 ## Clone the Repository
 
 ```bash
@@ -35,16 +47,18 @@ If you prefer to set things up manually, follow the steps below.
 
 2. [Configure](https://docs.docker.com/engine/install/linux-postinstall/) Docker Engine to run without sudo if it is not configured.
 
-3. Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#with-apt-ubuntu-debian) if it is not installed.
+3. Install [NVIDIA GPU driver](https://ubuntu.com/server/docs/nvidia-drivers-installation) if it is not installed.
 
-4. [Configure](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#configuring-docker) NVIDIA Container Toolkit for Docker if it is not configured.
+4. Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#with-apt-ubuntu-debian) if it is not installed.
+   
+5. [Configure](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#configuring-docker) NVIDIA Container Toolkit for Docker if it is not configured.
 
-5. Generate an NGC API key if not generated:
+6. Generate an NGC API key if not generated:
    1. Go to [NGC](https://ngc.nvidia.com/setup) and log in.
    2. Select **Setup** > **Generate API Key**.
    3. Copy the key (starts with `nvapi-`).
 
-6. Ensure you have at least **200 GB** of free disk space for Docker images, model weights, caches, and vector database data.
+7. Ensure you have at least **200 GB** of free disk space for Docker images, model weights, caches, and vector database data.
 
 ### Start Services
 
@@ -59,6 +73,76 @@ export USER_ID=$(id -u)
 - `NGC_API_KEY` is required to download models from NGC and to pull NIM container images.
 - `OFFLINE_INFERENCE_DIR` is mounted to the containers and used to store model weights, so they don't need to be re-downloaded on subsequent runs.
 - `USER_ID` is passed to the NIM containers so they run as the host user, avoiding permission issues on the mounted cache volumes.
+
+Compose creates missing `OFFLINE_INFERENCE_DIR` bind sources automatically. If startup fails with a permission error while writing model caches, or if Docker-created paths are owned by root, fix ownership and restart:
+
+```bash
+sudo mkdir -p "${OFFLINE_INFERENCE_DIR}"
+sudo chown -R "$(id -u):$(id -g)" "${OFFLINE_INFERENCE_DIR}"
+```
+
+#### Platform-specific settings
+
+The automated setup script auto-detects the host's GPUs and exports the
+environment variables below before `docker compose up`. In manual mode you set
+them yourself. The compose defaults target **DGX Spark** (a single unified-memory
+GPU), so **on DGX Spark you can skip this section**. On other hardware, export the
+variables that apply to your host alongside the ones above.
+
+Check your GPUs first:
+
+```bash
+nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
+```
+
+**1. gpt-oss NIM image tag — `GPT_OSS_IMAGE_TAG`**
+
+The gpt-oss NIM version is host-conditional:
+
+| Host | Setting |
+|---|---|
+| DGX Spark / any unified-memory GPU (GB10 — memory shows `[N/A]`) | Leave unset (default `1.6.1`). NIM 2.0.x can exhaust the 128 GB unified memory pool and hang the host — there is no memory limiter to bound it. |
+| Discrete GPUs (H100, GH200, …) | `export GPT_OSS_IMAGE_TAG=2.0.7` — 1.6.1 does not run on discrete GPUs. |
+
+**2. Multi-GPU placement**
+
+This layout applies only when **one** GPU is **Hopper or newer** (compute
+capability ≥ 9.0) **and ≥ 80 GB** to hold the LLM, **and a second** GPU is **≥ 24
+GB** for the small models. Dedicate that largest GPU to the LLM and put
+autocomplete, embedding, and reranking on the second — using each GPU's `index`
+column from `nvidia-smi`. Example — GPU `0` is the ≥ 80 GB LLM GPU, GPU `1` holds
+the small models:
+
+```bash
+export GPT_OSS_GPU=0
+export GPT_OSS_KVCACHE_PERCENT=0.9
+export AUTOCOMPLETE_GPU=1
+export AUTOCOMPLETE_GPU_MEM_UTIL=0.3
+export BGE_GPU=1
+export BGE_GPU_MEM_UTIL=0.05
+export RERANK_GPU=1
+```
+
+On a **single-GPU** host (DGX Spark), leave all of these unset — the defaults run
+every model on GPU `0` with Spark-tuned memory fractions.
+
+If **no single GPU clears 80 GB** (e.g. several 48 GB cards), this blueprint has no
+supported layout: the LLM would need tensor-parallel serving across GPUs, which is
+not configured here and must be set up manually. The automated setup script stops
+with guidance in that case.
+
+**3. Reranker model profile on GH200 — `NIM_MODEL_PROFILE`**
+
+On GH200 (aarch64 + Hopper, cc 9.0) the only cc-9.0 reranker TensorRT plan is
+x86_64-built and fails to deserialize, and NIM auto-selects it anyway. Pin the
+portable ONNX profile:
+
+```bash
+export NIM_MODEL_PROFILE=f7391ddbcb95b2406853526b8e489fedf20083a2420563ca3e65358ff417b10f
+```
+
+Leave unset on x86_64 and on other aarch64 hosts (DGX Spark GB10, GB200) — NIM
+auto-selects a loadable profile there.
 
 Authenticate Docker with the NGC container registry:
 
@@ -152,6 +236,45 @@ After the services are running on DGX Spark, connect from Visual Studio Code:
 
 Cursor, Windsurf, and VSCodium may work with additional extension-install and port-forwarding adjustments. These clients may not appear as native NVIDIA Sync apps. If the Visual Studio Marketplace is not available in the client, install the [Nsight Copilot extension from Open VSX](https://open-vsx.org/extension/NVIDIA/nsight-copilot), then configure `Server Origin` to `http://localhost:8080` and forward DGX Spark port `8080` to local port `8080`.
 
+### Forward ports over SSH
+
+If you reach the host from a plain terminal (any remote server, not only through
+NVIDIA Sync), forward the ports you need with `ssh -L`. The primary backend is
+port `8080`:
+
+```bash
+ssh -L 8080:localhost:8080 <user>@<host>
+```
+
+Keep that session open; while it runs, `http://localhost:8080` on your machine
+reaches the server on the host. Point the extension `Server Origin` (or your API
+client) at `http://localhost:8080`.
+
+To forward several ports at once — for example to hit an individual NIM directly —
+repeat `-L` (see [Service Ports](#service-ports) for the host ports):
+
+```bash
+# 8080 = primary backend, 8020 = rerank NIM
+ssh -L 8080:localhost:8080 -L 8020:localhost:8020 <user>@<host>
+```
+
+Run the tunnel in the background without opening a shell with `-fN`:
+
+```bash
+ssh -fN -L 8080:localhost:8080 <user>@<host>
+```
+
+`-L <local>:localhost:<remote>` maps a local port to the same port on the host's
+loopback, where Compose publishes the service. If a local port is taken, pick
+another and adjust `Server Origin` to match — e.g. `-L 8081:localhost:8080` with
+`Server Origin` set to `http://localhost:8081`.
+
+Verify a forwarded service from your machine — for example the rerank NIM on `8020`:
+
+```bash
+curl -s http://localhost:8020/v1/health/ready && echo OK
+```
+
 ### Model Context Protocol (MCP)
 
 The Nsight Copilot server exposes an MCP endpoint at `http://localhost:8080/mcp/cuda-docs`
@@ -192,7 +315,7 @@ In the default offline Compose deployment, prompts and code are served by local 
 | `docker pull` or NIM startup returns unauthorized | NGC key lacks required access | Re-run `docker login nvcr.io` and confirm the NGC key can pull `nvcr.io/nim/*` and `nvcr.io/nvidia/blueprint/*` images. |
 | Startup is slow or never completes | Services start one at a time (DGX Spark holds one model at a time), each gated on the previous passing its healthcheck plus a cache flush; first run also pulls model weights from NGC. A NIM that fails to initialize halts the whole chain and the main server never starts. | `docker compose ps` to see which service is currently `starting` or stuck `unhealthy` (or a `cache-flush`/`test-*` step that did not complete); `docker compose logs -f <service>` to follow it. First-run init is budgeted (GPT-OSS up to ~20 minutes) — if it is still progressing, wait; a service past its budget has genuinely failed. |
 | Disk fills during setup | Docker images plus model caches exceed available space | Meet the Prerequisites free-disk requirement; move `OFFLINE_INFERENCE_DIR` to a larger disk if needed. |
-| NIM reports no compatible profile or memory pressure | Host is not a DGX Spark | This blueprint targets NVIDIA DGX Spark only. Verify the host is a DGX Spark; NIM profile and memory settings are tuned for DGX Spark and are not user-configurable. |
+| NIM reports no compatible profile or memory pressure | Host GPU layout not recognized, or GPUs too small to hold a model on one device | The setup script auto-detects GPUs and tunes placement for single-GPU (DGX Spark) and multi-GPU hosts with a GPU ≥ 80 GB for the LLM plus a second GPU for the small models (see [Supported hardware](#supported-hardware)). When the GPUs are too small, the script stops — use suitable hardware or configure tensor-parallel serving manually. Confirm `nvidia-smi` reports the expected GPUs and memory; the setup script prints the chosen GPU placement profile during step 6. |
 | GPU containers cannot see GPUs | NVIDIA Container Toolkit missing or unconfigured | Run `docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi`. If it fails, see the [NVIDIA Container Toolkit troubleshooting guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/troubleshooting.html). |
 | No autocomplete suggestions in the IDE | Backend URL, port forwarding, or autocomplete service issue, or autocomplete toggle is off | Confirm the extension `Server Origin` is `http://localhost:8080`; confirm port `8080` is forwarded from DGX Spark to the client machine; check `docker compose ps autocomplete-nim litellm` shows both as `healthy`; verify autocomplete is enabled — click **Nsight Copilot** in the VS Code status bar (bottom-right) and ensure **Enable autocomplete** is on. |
 | Autocomplete suggestions are poor, distracting, or contain stray tokens | File language outside the model's primary training scope (CUDA, C++, Python), or autocomplete is not wanted for this session | The autocomplete model is fine-tuned mainly on CUDA, C++, and Python code; completion quality on other languages is limited. To disable inline suggestions, click **Nsight Copilot** in the VS Code status bar (bottom-right) and toggle **Enable autocomplete** off. The same menu re-enables it. |
