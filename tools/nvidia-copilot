@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# nvidia-copilot - helper to show the Nsight Copilot Docker Compose self-hosted deploy guide
+# Usage: nvidia-copilot [--pager|-p] [--path] [--help]
+set -euo pipefail
+
+# Resolve repository root (assumes script lives in repo/tools/)
+REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+GUIDE_PATH="$REPO_ROOT/docs/deploy-docker-self-hosted.md"
+
+if [[ ! -f "$GUIDE_PATH" ]]; then
+  echo "Guide not found at $GUIDE_PATH" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  --pager|-p)
+    if command -v less >/dev/null 2>&1; then
+      less "$GUIDE_PATH"
+    else
+      cat "$GUIDE_PATH"
+    fi
+    ;;
+  --path)
+    echo "$GUIDE_PATH"
+    ;;
+  --help|-h)
+    cat <<'USAGE'
+Usage: nvidia-copilot [--pager|-p] [--path] [--help]
+
+Options:
+  --pager, -p   Open the guide in the pager (less) if available, otherwise prints to stdout
+  --path        Print the absolute path to the guide file
+  --help, -h    Show this help message
+
+Description:
+  Prints or pages the "docs/deploy-docker-self-hosted.md" deployment guide for
+  deploying the NVIDIA Nsight Copilot Blueprint with Docker Compose on a single DGX Spark.
+USAGE
+    exit 0
+    ;;
+  *)
+    cat "$GUIDE_PATH"
+    ;;
+esac
