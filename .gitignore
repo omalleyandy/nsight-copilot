@@ -1,1 +1,7 @@
 .idea
+
+# Local deployment secrets and runtime state (see docs/deploy-docker-self-hosted.md)
+.env
+deploy/compose/etcd/
+deploy/compose/milvus/
+deploy/compose/minio/
